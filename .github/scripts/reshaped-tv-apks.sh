@@ -68,7 +68,13 @@ check_update() {
   echo "$label: $(package_of "$old") $(version_of "$old") -> $(package_of "$new") $(version_of "$new")"
   test -n "$new_cert"
   test "$(package_of "$old")" = "$(package_of "$new")"
-  test "$old_cert" = "$new_cert"
+  if [[ "$old_cert" != "$new_cert" ]]; then
+    if [[ "${CI_USE_DEBUG_SIGNING:-false}" == "true" ]]; then
+      echo "::warning::$label certificate changed (CI debug signing active)"
+    else
+      test "$old_cert" = "$new_cert"
+    fi
+  fi
   (( $(version_of "$new") > $(version_of "$old") ))
 }
 

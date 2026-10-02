@@ -1396,6 +1396,9 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
                 )
             }
         }
+        is PlayerEvent.OnTranslateWithGemini -> {
+            translateSubtitleWithGemini(event.subtitle)
+        }
         is PlayerEvent.OnSetPlaybackSpeed -> {
             if (isUsingMpvEngine()) {
                 setPlaybackSpeedInternal(event.speed)

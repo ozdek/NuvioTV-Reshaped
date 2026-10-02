@@ -1675,6 +1675,7 @@ fun PlayerScreen(
             onDisableSubtitles = { viewModel.onEvent(PlayerEvent.OnDisableSubtitles) },
             onEvent = { viewModel.onEvent(it) },
             onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) },
+            onTranslateWithGemini = { viewModel.onEvent(PlayerEvent.OnTranslateWithGemini(it)) },
             modifier = Modifier
                 .fillMaxSize()
                 .zIndex(2.6f)

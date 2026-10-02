@@ -32,8 +32,8 @@ defaults.buildConfigField("String", "SEEKR_API_KEY", buildConfigString(localProp
 defaults.buildConfigField("String", "RESHAPED_GOOGLE_TV_CLIENT_ID", buildConfigString(resolveProperty("RESHAPED_GOOGLE_TV_CLIENT_ID", "")))
 defaults.buildConfigField("String", "RESHAPED_GOOGLE_TV_CLIENT_SECRET", buildConfigString(resolveProperty("RESHAPED_GOOGLE_TV_CLIENT_SECRET", "")))
 // In-app updater: the fork's own GitHub releases.
-defaults.buildConfigField("String", "GITHUB_OWNER", buildConfigString(resolveProperty("NUVIO_UPDATE_GITHUB_OWNER", "NuvioMedia")))
-defaults.buildConfigField("String", "GITHUB_REPO", buildConfigString(resolveProperty("NUVIO_UPDATE_GITHUB_REPO", "NuvioTV")))
+defaults.buildConfigField("String", "GITHUB_OWNER", buildConfigString(resolveProperty("NUVIO_UPDATE_GITHUB_OWNER", "ozdek")))
+defaults.buildConfigField("String", "GITHUB_REPO", buildConfigString(resolveProperty("NUVIO_UPDATE_GITHUB_REPO", "NuvioTV-Reshaped")))
 defaults.buildConfigField("boolean", "AUTOSYNC_FORK", autoSyncFork.toString())
 
 // The "Nuvio RS" app name for every locale; the legacy bridge keeps the old name.
