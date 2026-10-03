@@ -39,11 +39,16 @@ import com.nuvio.tv.reshaped.sync.ReshapedSync
  * Several sources can be saved; their channels show as one list, in the order the sources were
  * added. A source that fails to load keeps the channels it had.
  */
+/** A replay link of a channel and the time it plays. */
+class LiveTvReplay(val playback: LiveTvChannel, val window: LiveTvReplayWindow)
+
 object LiveTvRepository {
     private const val TAG = "LiveTv"
     private const val EPG_TICK_MS = 60_000L
     /** How long a replay waits for the panel's HLS playlist before playing its TS replay. */
     private const val HLS_CHECK_MS = 6_000L
+    /** How long a part of a replay is when the guide has no programme for that time. */
+    private const val REPLAY_PART_MS = 30L * 60 * 1000
     /** Playlists: panels that build get.php on request may send nothing for a minute or more. */
     private const val PLAYLIST_READ_TIMEOUT_S = 120L
     private const val TS_PACKET = 188
@@ -186,7 +191,9 @@ object LiveTvRepository {
                 recentChannel = store.recentChannel(),
                 isLoading = sources.isNotEmpty(),
             )
-            sources.forEach { launchSourceLoad(it, adding = false) }
+            sources.forEach { launchSourceLoad(it, adding = false, useSaved = true) }
+            // Lists saved for sources removed meanwhile (here or by sync) go too.
+            scope.launch(Dispatchers.IO) { LiveTvListCache.keepOnly(appContext.cacheDir, profileId, sources.map { it.id }) }
         }
         watchIdle()
         return true
@@ -344,7 +351,9 @@ object LiveTvRepository {
             _uiState.update { it.copy(sources = sources, sourceErrors = it.sourceErrors - sourceId, error = null) }
             val orders = _uiState.value.sourceGroupOrders
             if (gone.identity in orders) _uiState.update { it.copy(sourceGroupOrders = orders - gone.identity) }
+            val savedList = savedListFile(gone)
             scope.launch(writer) {
+                savedList?.let(LiveTvListCache::delete)
                 // Removed by the viewer: the other devices remove it too on the next sync.
                 store.markSyncRemoved(gone.identity)
                 if (gone.identity in orders) store.saveSourceGroupOrders(orders - gone.identity)
@@ -354,6 +363,25 @@ object LiveTvRepository {
             ReshapedSync.onLocalChange()
             publish()
             updateLoading()
+        }
+    }
+
+    /**
+     * Moves a source [step] places up (negative) or down: its channels and categories follow it in
+     * the lists. Order only; the sources themselves are left as they are.
+     */
+    fun moveSource(sourceId: String, step: Int) {
+        val store = storage ?: return
+        scope.launch(serial) {
+            val sources = _uiState.value.sources
+            val from = sources.indexOfFirst { it.id == sourceId }
+            val to = from + step
+            if (from < 0 || to !in sources.indices) return@launch
+            val reordered = ArrayList(sources).apply { add(to, removeAt(from)) }
+            _uiState.update { it.copy(sources = reordered) }
+            scope.launch(writer) { store.saveSources(reordered) }
+            ReshapedSync.onLocalChange()
+            publish()
         }
     }
 
@@ -679,13 +707,22 @@ object LiveTvRepository {
     }
 
     /**
-     * The channel with the link to its past [programme] (catch-up), registered so the player
-     * treats it as Live TV that can be sought; null when the provider keeps no such programme.
+     * The replay of [channel]'s [programme] (catch-up; also one still on air, to watch it from the
+     * start), registered so the player treats it as Live TV that can be sought; null when the
+     * provider does not keep it. It runs on past the programme's end (see [replayChannel]).
      */
-    suspend fun catchupChannel(channel: LiveTvChannel, programme: LiveTvProgramme): LiveTvChannel? {
+    suspend fun catchupChannel(channel: LiveTvChannel, programme: LiveTvProgramme): LiveTvReplay? =
+        replayChannel(channel, programme.startEpochMs, programme.stopEpochMs)
+
+    /**
+     * A replay of [channel] from [startMs] to [programmeEndMs] (by default the end of the guide's
+     * programme on at [startMs]), never past now, so the player shows the programme's own length.
+     * The player asks for the next part, or goes live, as it gets to the end.
+     */
+    suspend fun replayChannel(channel: LiveTvChannel, startMs: Long, programmeEndMs: Long = replayPartEnd(channel, startMs)): LiveTvReplay? {
         val catchup = channel.catchup ?: return null
         val now = LiveTvClock.nowEpochMs()
-        if (!LiveTvCatchupLinks.isPlayable(catchup, programme, now)) return null
+        if (!LiveTvCatchupLinks.isPlayableFrom(catchup, startMs, now)) return null
         // Only an Xtream panel answers its /timeshift/ form; other "shift" servers take ?utc=.
         val source = _uiState.value.sources.firstOrNull { it.id == channel.sourceId }
         val xtreamPanel = source == null || source.type == LiveTvSourceType.Xtream ||
@@ -695,22 +732,38 @@ object LiveTvRepository {
         } else {
             null
         }
-        // A programme still on air plays from its start up to now.
-        val stop = minOf(programme.stopEpochMs, now)
+        // Just the programme (a seek bar as long as it is), up to now at most; one that overran
+        // goes on in the next part, which the player asks for at the end.
+        val stop = minOf(now, if (programmeEndMs > startMs) programmeEndMs else startMs + REPLAY_PART_MS)
         // "Prefer HLS": the panel's HLS replay has a length, so it shows a progress bar and seeks.
         // A panel that gives none (or no playlist in time) plays the TS replay as before.
         val hlsLink = if (LiveTvCatchupLinks.isXtreamReplay(channel.streamUrl, catchup, xtreamPanel) && preferHls()) {
-            LiveTvCatchupLinks.link(channel.streamUrl, catchup, programme.startEpochMs, stop, now, zone, xtreamPanel, hls = true)
+            LiveTvCatchupLinks.link(channel.streamUrl, catchup, startMs, stop, now, zone, xtreamPanel, hls = true)
                 ?.takeIf { isHlsPlaylist(it, channel.headers) }
         } else {
             null
         }
         val link = hlsLink
-            ?: LiveTvCatchupLinks.link(channel.streamUrl, catchup, programme.startEpochMs, stop, now, zone, xtreamPanel)
+            ?: LiveTvCatchupLinks.link(channel.streamUrl, catchup, startMs, stop, now, zone, xtreamPanel)
             ?: return null
-        LiveTvPlaybackRegistry.register(link, listUrl = channel.streamUrl, catchup = true)
+        // A link that stays the same for a later end names none, and plays on to live by itself.
+        val bounded = hlsLink != null ||
+            link != LiveTvCatchupLinks.link(channel.streamUrl, catchup, startMs, stop + 120_000L, now, zone, xtreamPanel)
+        val window = LiveTvReplayWindow(startMs, stop, bounded)
+        LiveTvPlaybackRegistry.register(link, listUrl = channel.streamUrl, catchup = true, window = window)
         recordRecentChannel(channel)
-        return channel.copy(streamUrl = link)
+        return LiveTvReplay(channel.copy(streamUrl = link), window)
+    }
+
+    /**
+     * Where the next part of a replay from [startMs] ends: the end of the programme on then (or the
+     * start of the next, after a gap in the guide), from the kept guide. Never a part of under a minute.
+     */
+    private fun replayPartEnd(channel: LiveTvChannel, startMs: Long): Long {
+        val minEnd = startMs + 60_000L
+        val programmes = keptSchedule[channel.guideKey].orEmpty()
+        val programme = programmes.firstOrNull { it.stopEpochMs > minEnd } ?: return startMs + REPLAY_PART_MS
+        return if (programme.startEpochMs > minEnd) programme.startEpochMs else programme.stopEpochMs
     }
 
     private fun preferHls(): Boolean {
@@ -788,13 +841,13 @@ object LiveTvRepository {
     }
 
     /** Loads one source in its own job, replacing only an earlier load of the same source. */
-    private fun launchSourceLoad(source: LiveTvSource, adding: Boolean) {
+    private fun launchSourceLoad(source: LiveTvSource, adding: Boolean, useSaved: Boolean = false) {
         val store = storage ?: return
         sourceJobs.remove(source.id)?.cancel()
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val outcome = loadPermits.withPermit {
                 try {
-                    Result.success(loadSource(source))
+                    Result.success(loadSource(source, useSaved))
                 } catch (cancel: CancellationException) {
                     throw cancel
                 } catch (error: Exception) {
@@ -896,8 +949,55 @@ object LiveTvRepository {
         LiveTvSourceType.Stalker -> LiveTvError.StalkerFailed
     }
 
-    /** One source's channels (tagged with the source) and guide links, plus a notice for a partial load. */
-    private suspend fun loadSource(source: LiveTvSource): Pair<LoadedSource, LiveTvError?> {
+    /** What a provider gave: its channels (not yet tagged with the source), guide links and category order. */
+    private class FetchedSource(
+        val channels: List<LiveTvChannel>,
+        val epgUrls: List<String>,
+        val providerOrder: List<String>,
+        val notice: LiveTvError?,
+    )
+
+    /** The saved copy of [source]'s list (links and Xtream panels; see [LiveTvListCache]), or null. */
+    private fun savedListFile(source: LiveTvSource): File? {
+        val profileId = loadedProfileId ?: return null
+        val saves = source.type == LiveTvSourceType.Xtream || (source.type == LiveTvSourceType.M3u && source.url.isHttpUrl())
+        return if (saves) LiveTvListCache.file(appContext.cacheDir, profileId, source.id) else null
+    }
+
+    /**
+     * One source's channels (tagged with the source) and guide links, plus a notice for a partial load.
+     * With [useSaved] (opening Live TV), a list saved within the guide refresh interval is used
+     * without asking the provider; an older one stands in only when the provider fails.
+     */
+    private suspend fun loadSource(source: LiveTvSource, useSaved: Boolean = false): Pair<LoadedSource, LiveTvError?> {
+        val savedFile = savedListFile(source)
+        val saved = if (savedFile != null && useSaved) withContext(Dispatchers.IO) { LiveTvListCache.read(savedFile, source) } else null
+        val nowMs = System.currentTimeMillis()
+        val fetched = if (saved != null && nowMs - saved.savedAtMs in 0 until EPG_DOWNLOAD_MS) {
+            FetchedSource(saved.channels, saved.epgUrls, saved.groupOrder, notice = null)
+        } else {
+            try {
+                fetchSource(source).also { fresh ->
+                    // Only a complete list is saved; writing it does not hold up showing it.
+                    if (savedFile != null && fresh.notice == null) {
+                        val entry = LiveTvListCache.Entry(fresh.channels, fresh.epgUrls, fresh.providerOrder, nowMs)
+                        scope.launch(Dispatchers.IO) { LiveTvListCache.write(savedFile, source, entry) }
+                    }
+                }
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                if (saved == null) throw error
+                // The provider is down or slow: its last list shows, with the error beside the source.
+                Log.w(TAG, "Live TV source ${source.type} failed, showing its saved list", error)
+                FetchedSource(saved.channels, saved.epgUrls, saved.groupOrder, notice = (error as? LiveTvException)?.error ?: fallbackError(source.type))
+            }
+        }
+        return tagSource(source, fetched)
+    }
+
+    /** Asks [source]'s provider (or reads its imported file) for its channels. */
+    private suspend fun fetchSource(source: LiveTvSource): FetchedSource {
         var notice: LiveTvError? = null
         var providerOrder: List<String> = emptyList()
         val (channels, epgUrls) = when (source.type) {
@@ -935,11 +1035,23 @@ object LiveTvRepository {
                 channels to listOf(stalkerGuideLink(source))
             }
         }
+        return FetchedSource(channels, epgUrls, providerOrder, notice)
+    }
+
+    /** [fetched]'s channels tagged with [source], its guide links and category order. */
+    private fun tagSource(source: LiveTvSource, fetched: FetchedSource): Pair<LoadedSource, LiveTvError?> {
+        val channels = fetched.channels
+        val epgUrls = fetched.epgUrls
+        val providerOrder = fetched.providerOrder
+        val notice = fetched.notice
         // Ids only need to be unique within a source; the list keys on them across all of them.
         val tagged = ArrayList<LiveTvChannel>(channels.size)
         val stalker = source.type == LiveTvSourceType.Stalker
         // The source's own user agent replaces the default one; a channel's own (#EXTVLCOPT) stays.
         val agent = source.userAgent.trim().takeIf { it.isNotEmpty() && !stalker }
+        // Channels share their header maps (the parser keeps one per distinct set): so do the
+        // maps with the source's agent, instead of one per channel.
+        val withAgent = HashMap<Map<String, String>, Map<String, String>>()
         channels.forEach { channel ->
             val group = channel.group.trim()
             // Portal channels without a guide id get one from their portal id, which the portal's guide uses.
@@ -949,7 +1061,7 @@ object LiveTvRepository {
                 channel.headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
                     .let { it == null || it == LIVE_TV_STREAM_HEADERS["User-Agent"] }
             ) {
-                withLiveTvUserAgent(channel.headers, agent)
+                withAgent.getOrPut(channel.headers) { withLiveTvUserAgent(channel.headers, agent) }
             } else {
                 channel.headers
             }
@@ -1218,6 +1330,7 @@ object LiveTvRepository {
                 groupOrder = groupOrder,
                 sourceGroupOrders = state.sourceGroupOrders,
                 recent = state.recentChannel,
+                sourceOrder = state.sources.filter { it.isSyncable }.map { it.identity },
             )
         }
         return shown ?: withContext(writer) { LiveTvStorage(context.applicationContext, profileId).syncData() }
@@ -1277,7 +1390,8 @@ object LiveTvRepository {
             val oldSources = _uiState.value.sources
             _uiState.update { state ->
                 state.copy(
-                    sources = state.sources.withSyncChange(before.sources, after.sources, store::newSourceId),
+                    sources = state.sources.withSyncChange(before.sources, after.sources, store::newSourceId)
+                        .withSyncOrder(before, after),
                     favoriteUrls = state.favoriteUrls.withSyncChange(before.favorites, after.favorites),
                     customLists = state.customLists.withSyncChange(before.customLists, after.customLists),
                     hiddenGroups = state.hiddenGroups.withSyncChange(before.hiddenGroups, after.hiddenGroups),
@@ -1330,7 +1444,7 @@ object LiveTvRepository {
             if (loadedProfileId == profileId) return@withContext false
             val store = LiveTvStorage(appContext, profileId)
             val sources = store.sources()
-            val synced = sources.withSyncChange(before.sources, after.sources, store::newSourceId)
+            val synced = sources.withSyncChange(before.sources, after.sources, store::newSourceId).withSyncOrder(before, after)
             store.saveSources(synced)
             val kept = synced.mapTo(HashSet()) { it.id }
             sources.filter { it.id !in kept }.forEach { store.deletePlaylistFile(it.id) }
@@ -1344,6 +1458,10 @@ object LiveTvRepository {
             if (before.recent != after.recent) after.recent?.let(store::saveRecentChannel)
             true
         }
+
+    /** Sync's new source order, when it brought one: sorting only, every source stays. */
+    private fun List<LiveTvSource>.withSyncOrder(before: LiveTvSyncData, after: LiveTvSyncData): List<LiveTvSource> =
+        if (after.sourceOrder.isNotEmpty() && after.sourceOrder != before.sourceOrder) inSyncOrder(after.sourceOrder) else this
 
     // endregion
 
@@ -1387,11 +1505,6 @@ object LiveTvRepository {
         // Which sources each guide belongs to, and how a portal's guide is fetched. Read here, on [serial].
         val sourceLinks = _uiState.value.sources.associate { it.id to loaded[it.id]?.epgUrls.orEmpty() }
         val sourcesById = _uiState.value.sources.associateBy { it.id }
-        // Every feed is matched against every channel, so a playlist without a guide of its own
-        // still finds its channels in another source's guide; the ranks below make a playlist's
-        // own guides win over another source's for its channels.
-        val request = LiveTvGuideRequest.from(channels)
-        val sourceForKey = channels.associate { it.guideKey to it.sourceId }
         val aheadHours = (window.aheadMs / (60L * 60 * 1000)).toInt()
         // A guide is fetched with the user agent of a source listing it that was given one.
         val guideHeaders = epgUrls.map { url ->
@@ -1425,6 +1538,9 @@ object LiveTvRepository {
             var schedule: LiveTvSchedule = keptSchedule
             var nextReadAtMs = 0L
             var firstRead = true
+            // Until then what is on now stays as it is: the minute tick skips working it out again.
+            var changeAtMs = 0L
+            var lastTickMs = 0L
             val publishGuide = { kept: LiveTvSchedule, logos: Map<String, String>?, nowMs: Long, failedLinks: Set<String>? ->
                 if (epgGeneration == generation) keptSchedule = kept
                 val current = currentProgrammes(kept, guideKeys, nowMs)
@@ -1462,6 +1578,12 @@ object LiveTvRepository {
                             nextReadAtMs = saved.nextReadAtMs
                             publishGuide(schedule, saved.logos, nowMs, emptySet())
                         } else {
+                            // Every feed is matched against every channel, so a playlist without a guide of its own
+                            // still finds its channels in another source's guide; the ranks below make a playlist's
+                            // own guides win over another source's for its channels. Built for each read and
+                            // let go after it: between reads they would only hold memory.
+                            val request = LiveTvGuideRequest.from(channels)
+                            val sourceForKey = channels.associate { it.guideKey to it.sourceId }
                             val previous = schedule
                             val previousLogos = _uiState.value.guideLogos.filterKeys { it in guideKeys }
                             val loaded = HashMap<String, List<LiveTvProgramme>>()
@@ -1532,16 +1654,24 @@ object LiveTvRepository {
                     }
                     // It starts over when Live TV is shown again.
                     if (finished == null) continue
+                    changeAtMs = 0L
                 }
-                val current = currentProgrammes(schedule, guideKeys, nowMs)
-                _uiState.update { state ->
-                    when {
-                        epgGeneration != generation -> state
-                        state.currentProgrammes != current || state.isEpgLoading ->
-                            state.copy(currentProgrammes = current, isEpgLoading = false)
-                        else -> state
+                // The clock set back also works it out again.
+                if (nowMs >= changeAtMs || nowMs < lastTickMs) {
+                    val current = currentProgrammes(schedule, guideKeys, nowMs)
+                    changeAtMs = nextProgrammeChange(schedule, guideKeys, nowMs)
+                    _uiState.update { state ->
+                        when {
+                            epgGeneration != generation -> state
+                            state.currentProgrammes != current || state.isEpgLoading ->
+                                state.copy(currentProgrammes = current, isEpgLoading = false)
+                            else -> state
+                        }
                     }
+                } else {
+                    _uiState.update { state -> if (epgGeneration == generation && state.isEpgLoading) state.copy(isEpgLoading = false) else state }
                 }
+                lastTickMs = nowMs
                 if (epgGeneration != generation) return@launch
                 delay(EPG_TICK_MS)
             }
@@ -1599,8 +1729,10 @@ object LiveTvRepository {
                 null
             }
             // A saved guide that has run out (a provider's file covering less than the refresh
-            // interval) is downloaded again rather than leaving the guide empty until then.
-            if (cached?.canReplaceSavedGuide == true && (cached.schedule.isEmpty() || cached.hasAhead(nowMs) || nowMs - saved < maxOf(EPG_MIN_READ_GAP_MS, EPG_DOWNLOAD_MS / 2))) return cached
+            // interval) is downloaded again rather than leaving the guide empty until then. A
+            // portal's guide is small and covers only the hours asked for: fetched again at once.
+            val runOutWait = if (url == null) EPG_MIN_READ_GAP_MS else maxOf(EPG_MIN_READ_GAP_MS, EPG_DOWNLOAD_MS / 2)
+            if (cached?.canReplaceSavedGuide == true && (cached.schedule.isEmpty() || cached.hasAhead(nowMs) || nowMs - saved < runOutWait)) return cached
             // Also repair a recently saved, incomplete feed from an earlier app version.
             if (force || saved == 0L || nowMs - saved !in 0 until EPG_DOWNLOAD_MS || cached != null) {
                 if (url != null) {
@@ -1640,6 +1772,11 @@ object LiveTvRepository {
             throw cancel
         } catch (error: Exception) {
             Log.w(TAG, "Guide failed", error)
+            return null
+        } catch (tooLarge: OutOfMemoryError) {
+            // A guide too large for this TV fails as that guide (as a too large list does), and
+            // the guide carries on with the others instead of stopping for the session.
+            Log.w(TAG, "Guide too large", tooLarge)
             return null
         }
     }

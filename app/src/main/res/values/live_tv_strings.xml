@@ -50,6 +50,8 @@
     <string name="live_tv_stalker_mac_hint">MAC address, e.g. 00:1A:79:12:34:56</string>
     <string name="live_tv_load">Load channels</string>
     <string name="live_tv_remove_source">Remove source</string>
+    <string name="live_tv_move_source_up">Move up</string>
+    <string name="live_tv_move_source_down">Move down</string>
     <string name="live_tv_edit_source">Edit</string>
     <string name="live_tv_source_edit_title">Edit source</string>
     <string name="live_tv_source_edit_description">Rename it, or change its address, login or guide. Hidden channels and favorites stay.</string>
@@ -89,8 +91,10 @@
 
     <string name="live_tv_player_channels">Channels</string>
     <string name="live_tv_player_categories_hint">◀ Categories  ·  ▶ Guide</string>
+    <string name="live_tv_player_programmes_hint">◀ Channels  ·  OK Watch</string>
     <string name="live_tv_player_hint">▲▼ Switch channel  ·  ◀ Channel list  ·  OK Info</string>
     <string name="live_tv_info_hint">OK Controls  ·  ◀ Channel list  ·  ▲▼ Switch channel</string>
+    <string name="live_tv_info_hint_start_over">OK Controls  ·  Hold OK Start over  ·  ◀ Channel list  ·  ▲▼ Switch channel</string>
     <string name="live_tv_info_now">Now</string>
     <string name="live_tv_info_next">Next · %1$s</string>
     <string name="live_tv_info_no_guide">No guide for this channel</string>
@@ -163,6 +167,7 @@
     <string name="live_tv_playlist_unavailable">Channel not in your sources now</string>
     <string name="live_tv_picking_keys">OK ticks a channel  ·  ◀ chooses the playlist  ·  Back stops</string>
     <string name="live_tv_choose_playlist">Choose the playlist</string>
+    <string name="live_tv_remove_from_list">Remove from %1$s</string>
     <string name="live_tv_choose_playlist_hint">The ticked channels go in it. If they are all in it already, they come out.</string>
     <string name="live_tv_moving_keys">▲▼ moves the channel  ·  OK puts it down</string>
     <plurals name="live_tv_picked">

@@ -9,6 +9,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -63,6 +66,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -203,6 +207,7 @@ fun LiveTvScreen(
         // Back from the background after a long while: the list may have been let go meanwhile.
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_START) {
+                LiveTvClock.followDeviceHourFormat(context)
                 viewModel.ensureLoaded()
                 com.nuvio.tv.reshaped.sync.ReshapedSync.onLiveTvOpened()
             }
@@ -248,7 +253,10 @@ fun LiveTvScreen(
     // With All channels (or Favorites) hidden in the settings, the first category shown stands in for it.
     val showAll by LiveTvPreferences.showAll.collectAsStateWithLifecycle()
     val showFavorites by LiveTvPreferences.showFavorites.collectAsStateWithLifecycle()
-    LaunchedEffect(uiState.hiddenGroups, uiState.sources, uiState.customLists, showAll, showFavorites, uiState.favoriteUrls.isEmpty()) {
+    LaunchedEffect(uiState.isLoaded, uiState.hiddenGroups, uiState.sources, uiState.customLists, showAll, showFavorites, uiState.favoriteUrls.isEmpty()) {
+        // Reloading (Live TV let go while unused): sources and playlists are not read back yet,
+        // and the category picked before must not fall back to all channels meanwhile.
+        if (!uiState.isLoaded) return@LaunchedEffect
         val multiSource = uiState.sources.size > 1
         val home = liveTvHomeFilter(uiState, showAll, showFavorites)
         filterKey = when (val current = filterFor(filterKey)) {
@@ -315,6 +323,7 @@ fun LiveTvScreen(
                         return@launch
                     }
                     viewModel.restoreFocusOnReturn = true
+                    viewModel.launchedUrl = channel.streamUrl
                     onPlay(route)
                 } catch (cancel: kotlinx.coroutines.CancellationException) {
                     launching = false
@@ -362,14 +371,9 @@ fun LiveTvScreen(
         visibleChannels.isNotEmpty() && runCatching { gridFocus.requestFocus() }.isSuccess
     }
     val currentToCategories by rememberUpdatedState(toCategories)
-    val currentOpenCategories by rememberUpdatedState(openCategories)
     // Unfavouriting a channel in Favorites removes its row: the guide moves to the next one, or
     // to the categories when none is left.
     var keepAfterRefilter by remember { mutableStateOf<String?>(null) }
-    val keepNeighbour: (LiveTvChannel) -> Unit = { channel ->
-        val index = visibleChannels.indexOfFirst { it.streamUrl == channel.streamUrl }
-        keepAfterRefilter = (visibleChannels.getOrNull(index + 1) ?: visibleChannels.getOrNull(index - 1))?.streamUrl
-    }
     // Set once the guide exists (it is made below).
     var onGuideLongPress: (LiveTvChannel) -> Unit = {}
     val guide = remember {
@@ -382,8 +386,8 @@ fun LiveTvScreen(
             // selected, or (scrolled out of view) the nearest one.
             onClose = { currentToCategories() },
             onExitLeft = { currentToCategories() },
-            // ▲ from the first channel: the settings button, at the top of the categories.
-            onExitUp = { currentOpenCategories(settingsFocus) },
+            // ▲ from the first channel stays there: the categories open only on ◀ or Back.
+            onExitUp = {},
             // Held OK: in a playlist of the viewer's, moves the channel; elsewhere starts picking
             // channels for favorites or a playlist.
             onLongPress = { channel -> onGuideLongPress(channel) },
@@ -407,6 +411,15 @@ fun LiveTvScreen(
         }
     }
     LaunchedEffect(filterKey, query) { guide.stopMoving() }
+    val keepNeighbour: (LiveTvChannel) -> Unit = { channel ->
+        val index = visibleChannels.indexOfFirst { it.streamUrl == channel.streamUrl }
+        // Several picked channels going at once: the nearest one staying, after it first.
+        val staying = { candidate: LiveTvChannel -> candidate.streamUrl !in guide.picked }
+        keepAfterRefilter = (
+            (index + 1 until visibleChannels.size).asSequence().map(visibleChannels::get).firstOrNull(staying)
+                ?: (index - 1 downTo 0).asSequence().map(visibleChannels::get).firstOrNull(staying)
+            )?.streamUrl
+    }
     /**
      * A list chosen while picking: the picked channels go in (or, when all of them are in it
      * already, come out), and the guide is as before.
@@ -454,7 +467,9 @@ fun LiveTvScreen(
     LaunchedEffect(visibleChannels, filtering) {
         if (!viewModel.restoreFocusOnReturn || filtering || visibleChannels.isEmpty()) return@LaunchedEffect
         viewModel.restoreFocusOnReturn = false
-        guide.selectRow(visibleChannels.indexOfFirst { it.streamUrl == uiState.recentChannel?.streamUrl }.coerceAtLeast(0))
+        // Zapped into another category meanwhile: the channel it was started from.
+        val recent = visibleChannels.indexOfFirst { it.streamUrl == uiState.recentChannel?.streamUrl }
+        guide.selectRow(if (recent >= 0) recent else visibleChannels.indexOfFirst { it.streamUrl == viewModel.launchedUrl }.coerceAtLeast(0))
         guide.backToNow()
         repeat(10) {
             withFrameNanos { }
@@ -462,10 +477,13 @@ fun LiveTvScreen(
         }
     }
 
+    // Focus gone from Live TV altogether (▲ from the categories to the menu bar): the preview stops.
+    var screenFocused by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(NuvioTheme.colors.Background),
+            .background(NuvioTheme.colors.Background)
+            .onFocusChanged { screenFocused = it.hasFocus },
     ) {
         if (!uiState.isLoaded && !uiState.isLoading && !uiState.hasSource) {
             LiveTvEmptyState(onAddSource = { showSourceDialog = true })
@@ -482,13 +500,15 @@ fun LiveTvScreen(
                     clock = minuteClock,
                     showTitle = showBuiltInHeader,
                     preview = if (previewsEnabled) preview else null,
-                    playVideo = (gridFocused || settingsFocused || categoriesOpen) && started && !launching &&
+                    // The guide keeps six channels; the header (description, preview) takes the rest.
+                    modifier = Modifier.weight(1f),
+                    playVideo = (gridFocused || settingsFocused || (categoriesOpen && screenFocused)) && started && !launching &&
                         !showSourceDialog && !showCategoryDialog && !showMenu && !showPlaylists &&
                         !naming && editingList == null,
                 )
                 Spacer(Modifier.height(NuvioTheme.spacing.sm))
                 LaunchedEffect(gridFocused) { if (gridFocused) categoriesOpen = false }
-                Box(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.fillMaxWidth().height(GUIDE_RULER + GUIDE_ROW * GUIDE_ROWS)) {
                     // The guide moves aside for the categories: drawn moved, not laid out again.
                     val shift by animateDpAsState(
                         if (categoriesOpen || guide.selecting) CATEGORY_COLUMN + NuvioTheme.spacing.md else 0.dp,
@@ -510,9 +530,10 @@ fun LiveTvScreen(
                             state = guide,
                             active = gridFocused,
                             clock = minuteClock,
-                            // About 7 channels at once, with room for longer names.
+                            // Six channels at once, with room for longer names.
                             channelColumn = 280.dp,
-                            rowHeight = 52.dp,
+                            rowHeight = GUIDE_ROW,
+                            rulerHeight = GUIDE_RULER,
                             modifier = Modifier.fillMaxSize(),
                             corner = { LiveTvGuideDate(guide.viewStartMs, minuteClock) },
                         )
@@ -556,7 +577,9 @@ fun LiveTvScreen(
                             onNewList = { naming = true },
                             onEditList = { editingList = it },
                             pickMode = guide.selecting,
+                            picked = guide.picked.keys,
                             onChoose = choosePlaylist,
+                            settingsFocus = settingsFocus,
                             settingsButton = {
                                 LiveTvPillButton(
                                     text = "",
@@ -837,6 +860,7 @@ private fun LiveTvHeader(
     showTitle: Boolean,
     preview: LiveTvPreviewPlayer?,
     playVideo: Boolean,
+    modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val shownChannel = guide.channel
@@ -856,33 +880,41 @@ private fun LiveTvHeader(
         uiState.isEpgLoading -> stringResource(R.string.live_tv_guide_loading)
         else -> null
     }
-    Row(modifier = Modifier.fillMaxWidth().height(HEADER_HEIGHT)) {
-        LiveTvGuideInfo(
-            channel = shownChannel,
-            logo = shownChannel?.let(uiState::logoFor),
-            programme = shownProgramme,
-            clock = clock,
-            status = status,
-            statusIsError = (failedSource != null || uiState.error != null) && !uiState.isLoading,
-            showTitle = showTitle && shownChannel == null,
-            modifier = Modifier.weight(1f).fillMaxHeight(),
-        )
-        if (preview != null) {
-            LiveTvPreviewVideo(
-                preview = preview,
+    BoxWithConstraints(modifier = modifier.fillMaxWidth().heightIn(min = HEADER_HEIGHT)) {
+        // Never shorter than before; on a tall screen it grows with what the guide leaves.
+        val headerHeight = maxHeight.coerceAtLeast(HEADER_HEIGHT)
+        Row(modifier = Modifier.fillMaxWidth().height(headerHeight)) {
+            LiveTvGuideInfo(
                 channel = shownChannel,
                 logo = shownChannel?.let(uiState::logoFor),
-                playVideo = playVideo,
-                modifier = Modifier.padding(start = NuvioTheme.spacing.xl).fillMaxHeight(),
+                programme = shownProgramme,
+                clock = clock,
+                status = status,
+                statusIsError = (failedSource != null || uiState.error != null) && !uiState.isLoading,
+                showTitle = showTitle && shownChannel == null,
+                height = headerHeight,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
             )
+            if (preview != null) {
+                LiveTvPreviewVideo(
+                    preview = preview,
+                    channel = shownChannel,
+                    logo = shownChannel?.let(uiState::logoFor),
+                    playVideo = playVideo,
+                    modifier = Modifier.padding(start = NuvioTheme.spacing.xl).fillMaxHeight(),
+                )
+            }
         }
     }
 }
 
+/** The least the header takes; it grows into what the guide's six rows leave. */
 private val HEADER_HEIGHT = 104.dp
+private val GUIDE_ROW = 52.dp
+private val GUIDE_RULER = 28.dp
+private const val GUIDE_ROWS = 6
 
 private const val POSTER_DELAY_MS = 250L
-private val POSTER_WIDTH = HEADER_HEIGHT * 2 / 3
 
 /** "Wed, Sep 30 · 9:43 AM": the day the guide shows, and the time now. */
 @Composable
@@ -914,6 +946,8 @@ private fun LiveTvGuideInfo(
     status: String?,
     statusIsError: Boolean,
     showTitle: Boolean,
+    /** The header's height: the programme's 2:3 picture fills it. */
+    height: Dp,
     modifier: Modifier = Modifier,
 ) {
     Row(modifier = modifier) {
@@ -929,8 +963,9 @@ private fun LiveTvGuideInfo(
         var posterSlot by remember { mutableStateOf(false) }
         LaunchedEffect(image != null) { if (image != null) posterSlot = true }
         if (posterSlot) {
-            Box(modifier = Modifier.padding(end = NuvioTheme.spacing.lg).size(POSTER_WIDTH, HEADER_HEIGHT)) {
-                LiveTvPoster(url = poster, width = POSTER_WIDTH, height = HEADER_HEIGHT)
+            val posterWidth = height * 2 / 3
+            Box(modifier = Modifier.padding(end = NuvioTheme.spacing.lg).size(posterWidth, height)) {
+                LiveTvPoster(url = poster, width = posterWidth, height = height)
             }
         }
         // A new selection fades in instead of switching hard; the fade is drawn, not recomposed.
@@ -1000,15 +1035,16 @@ private fun LiveTvGuideInfo(
                             modifier = Modifier.padding(top = 6.dp).widthIn(max = 420.dp).fillMaxWidth(),
                         )
                     }
-                    // One line only: a status (guide loading, a source failing) takes its place, so it fits.
+                    // As many lines as the header leaves room for (up to four); a status (guide
+                    // loading, a source failing) takes its place, so it fits.
                     programme.description?.takeIf { status == null }?.let { description ->
                         Text(
                             text = description,
                             style = MaterialTheme.typography.bodySmall,
                             color = NuvioTheme.colors.TextTertiary,
-                            maxLines = 1,
+                            maxLines = 4,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = 6.dp).widthIn(max = 640.dp),
+                            modifier = Modifier.padding(top = 6.dp).widthIn(max = 720.dp).weight(1f, fill = false),
                         )
                     }
                 }
@@ -1040,6 +1076,8 @@ private class LiveTvCategoryEntry(
     val listId: String? = null,
     /** "+ New playlist": OK names one, focus picks nothing. */
     val action: Boolean = false,
+    /** While picking: the list has every ticked channel, so OK takes them out. */
+    val removes: Boolean = false,
 )
 
 /**
@@ -1062,8 +1100,12 @@ private fun LiveTvCategoryColumn(
     onEditList: (String) -> Unit,
     settingsButton: @Composable () -> Unit,
     modifier: Modifier = Modifier,
+    /** The settings button beside the search, which ◀ and ▶ on the search reach. */
+    settingsFocus: FocusRequester? = null,
     /** Channels are being picked: only Favorites and the playlists, to choose where they go. */
     pickMode: Boolean = false,
+    /** The ticked channels' links: a list that has them all offers to take them out instead. */
+    picked: Set<String> = emptySet(),
     onChoose: (String) -> Unit = {},
 ) {
     val selectedModifier = Modifier.focusRequester(selectedFocus)
@@ -1077,23 +1119,32 @@ private fun LiveTvCategoryColumn(
     val collapsed = viewModel.collapsedSources
     val allLabel = stringResource(R.string.live_tv_all_channels)
     val favoritesLabel = stringResource(R.string.live_tv_favorites)
-    val newListLabel = stringResource(R.string.live_tv_playlist_new)
     val uncategorised = liveTvGroupLabel(LIVE_TV_UNGROUPED)
-    val pickEntries = remember(newListLabel, uiState.customLists, favoritesLabel) {
+    // New playlists are made only in the menu's My playlists.
+    val removeFrom = stringResource(R.string.live_tv_remove_from_list)
+    val pickedNow = if (pickMode) picked.toSet() else emptySet()
+    val pickEntries = remember(uiState.customLists, uiState.favoriteUrls, favoritesLabel, pickedNow, removeFrom) {
+        // OK takes the ticked channels out of a list that has them all already: it says so.
+        fun hasAll(urls: Collection<String>) = pickedNow.isNotEmpty() && pickedNow.all(urls::contains)
+        fun entry(key: String, name: String, urls: Collection<String>, count: Int?, listId: String?) =
+            if (hasAll(urls)) {
+                LiveTvCategoryEntry(key, removeFrom.format(name), count = count, listId = listId, removes = true)
+            } else {
+                LiveTvCategoryEntry(key, name, count = count, listId = listId)
+            }
         buildList {
-            add(LiveTvCategoryEntry(FILTER_FAVORITES, favoritesLabel))
-            uiState.customLists.forEach { add(LiveTvCategoryEntry(FILTER_LIST_PREFIX + it.id, it.name, count = it.urls.size, listId = it.id)) }
-            add(LiveTvCategoryEntry(NEW_LIST_KEY, newListLabel, action = true))
+            add(entry(FILTER_FAVORITES, favoritesLabel, uiState.favoriteUrls, null, null))
+            uiState.customLists.forEach { add(entry(FILTER_LIST_PREFIX + it.id, it.name, it.urls, it.urls.size, it.id)) }
         }
     }
     val showAll by LiveTvPreferences.showAll.collectAsStateWithLifecycle()
     val showFavorites by LiveTvPreferences.showFavorites.collectAsStateWithLifecycle()
-    val entries = remember(newListLabel, sections, visibleGroups, uiState.groupNames, uiState.customLists, collapsed.toMap(), allLabel, favoritesLabel, uncategorised, showAll, showFavorites) {
+    val entries = remember(sections, visibleGroups, uiState.groupNames, uiState.customLists, collapsed.toMap(), allLabel, favoritesLabel, uncategorised, showAll, showFavorites) {
         fun label(group: String) = liveTvGroupName(group, uiState.groupNames) ?: if (group == LIVE_TV_UNGROUPED) uncategorised else group
         buildList {
             if (showFavorites) add(LiveTvCategoryEntry(FILTER_FAVORITES, favoritesLabel))
+            // New playlists are made only in the menu's My playlists, not here.
             uiState.customLists.forEach { add(LiveTvCategoryEntry(FILTER_LIST_PREFIX + it.id, it.name, count = it.urls.size, listId = it.id)) }
-            add(LiveTvCategoryEntry(NEW_LIST_KEY, newListLabel, action = true))
             if (showAll) add(LiveTvCategoryEntry(FILTER_ALL, allLabel, count = sections?.total))
             val bySource = sections?.sources
             if (bySource != null && bySource.size > 1) {
@@ -1160,7 +1211,11 @@ private fun LiveTvCategoryColumn(
                     // Consumes the guide's ◀ mark, so a later category focus picks as usual.
                     holdSelection = holdSelection,
                     count = entry.count,
-                    icon = if (entry.action) Icons.Filled.Add else null,
+                    icon = when {
+                        entry.removes -> Icons.Filled.Remove
+                        entry.action -> Icons.Filled.Add
+                        else -> null
+                    },
                     onClick = { onChoose(entry.key) },
                 ) {}
             }
@@ -1179,6 +1234,7 @@ private fun LiveTvCategoryColumn(
                     placeholder = stringResource(R.string.live_tv_search),
                     keyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
                     modifier = Modifier.weight(1f),
+                    sideFocus = settingsFocus,
                 )
                 settingsButton()
             }

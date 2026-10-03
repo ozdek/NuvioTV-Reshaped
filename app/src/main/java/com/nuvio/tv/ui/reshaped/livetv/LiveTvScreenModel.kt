@@ -77,6 +77,8 @@ class LiveTvScreenModel @Inject constructor(
 
     /** Set when a channel starts playing: on return, focus goes back to the channel last watched. */
     var restoreFocusOnReturn = false
+    /** The channel played from the guide, for the return when the one last watched is not in the list shown. */
+    var launchedUrl: String? = null
 
     /** Sources whose categories are folded away in the category column. */
     val collapsedSources = androidx.compose.runtime.mutableStateMapOf<String, Boolean>()
@@ -171,9 +173,10 @@ internal suspend fun liveTvPlayerRoute(channel: LiveTvChannel, profileId: Int): 
  * timeline treats catch-up links as seekable (see [LiveTvPlaybackRegistry.isCatchup]).
  */
 internal suspend fun liveTvCatchupRoute(channel: LiveTvChannel, programme: LiveTvProgramme, profileId: Int): String? {
-    val playback = LiveTvRepository.catchupChannel(channel, programme) ?: return null
+    val replay = LiveTvRepository.catchupChannel(channel, programme) ?: return null
+    val playback = replay.playback
     val playerUrl = PlayerMediaSourceFactory.normalizePlaybackRequest(playback.streamUrl, playback.headers).url
-    LiveTvPlaybackRegistry.register(playerUrl, listUrl = channel.streamUrl, catchup = true)
+    LiveTvPlaybackRegistry.register(playerUrl, listUrl = channel.streamUrl, catchup = true, window = replay.window)
     return Screen.Player.createRoute(
         streamUrl = playback.streamUrl,
         title = programme.title,
