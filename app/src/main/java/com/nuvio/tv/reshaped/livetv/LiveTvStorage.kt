@@ -56,6 +56,7 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
             xtream = LiveTvXtreamSettings(optString("server"), optString("xtreamUser"), optString("xtreamPassword")),
             epgUrl = optString("epg"),
             name = optString("name"),
+            userAgent = optString("ua"),
         )
     }
 
@@ -65,6 +66,7 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
         put("url", url)
         if (epgUrl.isNotBlank()) put("epg", epgUrl)
         if (name.isNotBlank()) put("name", name)
+        if (userAgent.isNotBlank()) put("ua", userAgent)
         when (type) {
             LiveTvSourceType.M3u -> Unit
             LiveTvSourceType.Stalker -> {
@@ -127,7 +129,13 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
         val target = playlistFileFor(sourceId)
         playlistDir.mkdirs()
         val temp = File(target.path + ".tmp")
-        write(temp)
+        try {
+            write(temp)
+        } catch (error: Throwable) {
+            // A failed or too large upload leaves no partial file behind.
+            temp.delete()
+            throw error
+        }
         if (!temp.renameTo(target)) {
             target.delete()
             temp.renameTo(target)
@@ -213,6 +221,21 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
         prefs.edit().putOrRemove(GROUP_ORDER, encodeGroups(groups)).apply()
     }
 
+    /** Each source's own category order (see [LiveTvUiState.sourceGroupOrders]), by source identity. */
+    fun sourceGroupOrders(): Map<String, List<String>> = runCatching {
+        val json = JSONObject(string(SOURCE_GROUP_ORDER) ?: return emptyMap())
+        json.keys().asSequence().associateWith { key ->
+            val array = json.optJSONArray(key)
+            (0 until (array?.length() ?: 0)).mapNotNull { array?.optString(it) }
+        }.filterValues { it.isNotEmpty() }
+    }.getOrDefault(emptyMap())
+
+    fun saveSourceGroupOrders(orders: Map<String, List<String>>) {
+        val json = JSONObject()
+        orders.forEach { (identity, groups) -> if (groups.isNotEmpty()) json.put(identity, JSONArray(groups)) }
+        prefs.edit().putOrRemove(SOURCE_GROUP_ORDER, if (json.length() == 0) null else json.toString()).apply()
+    }
+
     /** The viewer's own playlists, oldest first. */
     fun customLists(): List<LiveTvCustomList> = runCatching {
         val array = JSONArray(string(CUSTOM_LISTS) ?: return emptyList())
@@ -237,6 +260,23 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
 
     fun saveFavoriteUrls(urls: Set<String>) {
         prefs.edit().putOrRemove(FAVORITES, urls.joinToString("\n")).apply()
+    }
+
+    /**
+     * Sources the viewer removed here (by [LiveTvSource.identity]) that sync has not sent yet:
+     * only these are deleted on the other devices (see reshaped/sync LiveTvSections).
+     */
+    fun syncRemovedSources(): Set<String> =
+        string(SYNC_REMOVED)?.lineSequence()?.filter(String::isNotBlank)?.toHashSet().orEmpty()
+
+    fun markSyncRemoved(identity: String) {
+        prefs.edit().putOrRemove(SYNC_REMOVED, (syncRemovedSources() + identity).joinToString("\n")).apply()
+    }
+
+    /** Sync sent [identities]' removal; a source added back later is no longer removed. */
+    fun clearSyncRemoved(identities: Collection<String>) {
+        val left = syncRemovedSources() - identities.toSet()
+        prefs.edit().putOrRemove(SYNC_REMOVED, left.joinToString("\n")).apply()
     }
 
     fun recentChannel(): LiveTvRecentChannel? {
@@ -264,8 +304,10 @@ internal class LiveTvStorage(context: Context, private val profileId: Int) {
     companion object {
         const val PREFS = "nuvio_live_tv"
         private const val SOURCES = "sources"
+        private const val SYNC_REMOVED = "sync_removed_sources"
         private const val HIDDEN_GROUPS = "hidden_groups"
         private const val GROUP_ORDER = "group_order"
+        private const val SOURCE_GROUP_ORDER = "source_group_order"
         private const val GROUP_NAMES = "group_names"
         private const val LEGACY_HIDDEN_CHANNELS = "hidden_channel_urls"
         private const val UNGROUPED_LINE = "\uE000"

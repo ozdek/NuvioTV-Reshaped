@@ -1,6 +1,4 @@
-- **Live TV guide overhaul.** Guides now work better with Stalker portals and Xtream M3U sources, support editable guide links, read while downloading, show more rows, and move more smoothly.
-- **Catch-up TV.** Supported providers can open past programmes directly from the guide.
-- **Custom channel playlists.** Build your own playlists from channels across different Live TV sources and sync them with Google.
-- **Faster channel management.** Select several channels at once to add them to favourites or playlists, and hold OK inside a playlist to move a channel.
-- **More efficient AutoSync.** It gets more useful information from each sampled spot, skips recognition work that cannot help, re-evaluates listening when the stream changes, and counts each place in the film only once when voting on words.
-- **Updated to official NuvioTV 1.1.0-beta.3.** Reshaped AutoSync, AudioSync, Live TV, seek previews, sync, fonts and navigation remain preserved.
+- **Google sync no longer loses playlists.** A device that is missing playlists no longer deletes them from your other devices. Only playlists you remove yourself are removed everywhere, and each TV profile keeps its own Live TV. Imported playlist files, removals and changes made while Live TV opens now sync reliably.
+- **Bigger, easier guide.** Guide rows are taller, so about seven channels show at once. Channel names get more room, and the preview and description at the top are smaller.
+- **Reorder categories in every playlist.** When you have more than one playlist, Edit categories lists each playlist's categories separately. This means categories with the same name in a second or third playlist can now be moved, and the player's channel panel follows the same order.
+- **Portal and link fixes.** Stalker portals load channels when the MAC is typed without colons. Links with a "|" in the password are no longer cut off, and a channel's own user agent is kept.
